@@ -104,6 +104,83 @@ static std::string ascii_lower(const std::string_view s) {
   return out;
 }
 
+// The bytes Ruby's String#strip trims. An [ltable] body is stripped before it
+// splits into rows.
+static bool is_ruby_space(unsigned char c) {
+  return c == '\0' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r' || c == ' ';
+}
+
+static std::string ruby_strip(const std::string_view s) {
+  size_t begin = 0;
+  size_t end = s.size();
+  while (begin < end && is_ruby_space(s[begin])) begin++;
+  while (end > begin && is_ruby_space(s[end - 1])) end--;
+  return std::string(s.substr(begin, end - begin));
+}
+
+// Split rows on '\n', matching ruby's `body.split(/\n/)`: a bare '\r' stays on
+// the row, and trailing empty rows are dropped (ruby split without a limit).
+static std::vector<std::string> split_ltable_rows(const std::string& s) {
+  std::vector<std::string> rows;
+  std::string row;
+  for (char c : s) {
+    if (c == '\n') {
+      rows.push_back(row);
+      row.clear();
+    } else {
+      row += c;
+    }
+  }
+  rows.push_back(row);
+  while (!rows.empty() && rows.back().empty()) rows.pop_back();
+  return rows;
+}
+
+// Split cells on '|', matching ruby's `row.split(/(?<!\\)\|/)`: a '|' preceded
+// by a backslash is literal (and keeps the backslash), and trailing empty
+// cells are dropped.
+static std::vector<std::string> split_ltable_cells(const std::string& s) {
+  std::vector<std::string> cells;
+  std::string cell;
+  for (size_t i = 0; i < s.size(); i++) {
+    if (s[i] == '|' && (i == 0 || s[i - 1] != '\\')) {
+      cells.push_back(cell);
+      cell.clear();
+    } else {
+      cell += s[i];
+    }
+  }
+  cells.push_back(cell);
+  while (!cells.empty() && cells.back().empty()) cells.pop_back();
+  return cells;
+}
+
+// Turns an [ltable] body into the [table] markup it stands for, the first row a
+// [thead] of [th] cells and the rest [tbody] rows of [td] cells. The body parses
+// in a nested pass that closes the table at its end, so a construct in a cell
+// cannot consume the text after [/ltable]. An empty body yields
+// "[table][/tbody][/table]", and the table machinery emits that stray [/tbody]
+// as literal text.
+static std::string expand_ltable(const std::string_view body) {
+  std::vector<std::string> rows = split_ltable_rows(ruby_strip(body));
+
+  std::string out = "[table]";
+  for (size_t r = 0; r < rows.size(); r++) {
+    std::vector<std::string> cells = split_ltable_cells(rows[r]);
+    if (r == 0) {
+      out += "[thead][tr]";
+      for (const auto& cell : cells) out += "[th]" + cell + "[/th]";
+      out += "[/tr][/thead][tbody]";
+    } else {
+      out += "[tr]";
+      for (const auto& cell : cells) out += "[td]" + cell + "[/td]";
+      out += "[/tr]";
+    }
+  }
+  out += "[/tbody][/table]";
+  return out;
+}
+
 %%{
 machine dtext;
 
@@ -138,6 +215,9 @@ action mark_b2 { b2 = p; }
 
 action in_quote { dstack_is_open(BLOCK_QUOTE) }
 action in_section { dstack_is_open(BLOCK_SECTION) }
+# Guards the [ltable] rule off inside an expansion, so a nested [ltable] stays
+# literal and emit_ltable cannot recurse.
+action outside_expansion { !in_expansion }
 
 newline = '\r\n' | '\n';
 
@@ -463,6 +543,12 @@ inline := |*
     fret;
   };
 
+  '[ltable]'i when outside_expansion => {
+    dstack_close_before_block();
+    fexec ts;
+    fret;
+  };
+
   '[/table]'i space* => {
     g_debug("inline [/table]");
     dstack_close_before_block();
@@ -602,6 +688,17 @@ inline_code := |*
   };
 *|;
 
+ltable := |*
+  '[/ltable]'i => {
+    emit_ltable();
+    fret;
+  };
+
+  any => {
+    ltable_buffer.push_back(fc);
+  };
+*|;
+
 code := |*
   '[/code]'i => {
     if (dstack_check(BLOCK_CODE)) {
@@ -618,6 +715,12 @@ code := |*
 *|;
 
 table := |*
+  '[ltable]'i when outside_expansion => {
+    ltable_buffer.clear();
+    in_ltable = true;
+    fcall ltable;
+  };
+
   '[thead]'i => {
     dstack_open_block(BLOCK_THEAD);
   };
@@ -728,6 +831,12 @@ main := |*
     dstack_close_leaf_blocks();
     dstack_open_block(BLOCK_TABLE);
     fcall table;
+  };
+
+  '[ltable]'i when outside_expansion => {
+    ltable_buffer.clear();
+    in_ltable = true;
+    fcall ltable;
   };
 
   list_item => {
@@ -855,6 +964,23 @@ template <class SinkT>
 void StateMachine<SinkT>::emit_post_search_link(const std::string_view tag, const std::string_view title) {
   std::string href = "/posts?tags=" + uri_escape(ascii_lower(tag));
   sink.post_search_link(href, title);
+}
+
+template <class SinkT>
+void StateMachine<SinkT>::emit_ltable() {
+  in_ltable = false;
+
+  // Close leaf blocks first, the way the block [table] rule does before it
+  // opens, so a preceding paragraph ends before the table rather than being
+  // pulled into it.
+  std::string expanded = expand_ltable(ltable_buffer);
+  dstack_close_leaf_blocks();
+
+  // Parse the expansion into the same sink. A nested machine keeps its own
+  // ragel state and dstack, but every open/close it emits is routed to the
+  // shared sink, so the table attaches to this parser's current container.
+  StateMachine<SinkT> nested(expanded, dtext_en_main, allow_color, sink, /*in_expansion=*/true);
+  nested.run();
 }
 
 template <class SinkT>
@@ -1027,8 +1153,8 @@ static inline const char* find_boundary_c(const char* c) {
 }
 
 template <class SinkT>
-StateMachine<SinkT>::StateMachine(const std::string_view dtext, int initial_state, bool allow_color, SinkT& sink)
-    : sink(sink), allow_color(allow_color) {
+StateMachine<SinkT>::StateMachine(const std::string_view dtext, int initial_state, bool allow_color, SinkT& sink, bool in_expansion)
+    : sink(sink), allow_color(allow_color), in_expansion(in_expansion) {
   stack.reserve(16);
   dstack.reserve(16);
 
@@ -1046,6 +1172,12 @@ void StateMachine<SinkT>::run() {
 
   %% write init nocs;
   %% write exec;
+
+  // A [ltable] with no closing tag runs to EOF; flush the captured body so an
+  // unterminated legacy table still renders (ruby's regex allowed \z to close).
+  if (in_ltable) {
+    emit_ltable();
+  }
 
   sm->dstack_close_all();
 }

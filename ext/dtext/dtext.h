@@ -19,7 +19,7 @@ class DTextError : public std::runtime_error {
 template <class SinkT>
 class StateMachine {
 public:
-  StateMachine(std::string_view dtext, int initial_state, bool allow_color, SinkT& sink);
+  StateMachine(std::string_view dtext, int initial_state, bool allow_color, SinkT& sink, bool in_expansion = false);
   void run();
 
 private:
@@ -37,6 +37,9 @@ private:
   void emit_named_url(std::string_view url, std::string_view title);
   void emit_wiki_link(std::string_view tag, std::string_view title);
   void emit_post_search_link(std::string_view tag, std::string_view title);
+  // Expands a captured [ltable] body into a [table] and parses it into the same
+  // sink, so a legacy table runs through the table machinery.
+  void emit_ltable();
 
   void dstack_open_block(element_t type);
   void dstack_open_inline(element_t type);
@@ -79,12 +82,21 @@ private:
   bool header_mode = false;
   int ignored_sup_sub_tags = 0;
 
+  // The [ltable] capture scanner accumulates the body here; in_ltable marks
+  // that a body is open so an unterminated [ltable] still flushes at EOF.
+  std::string ltable_buffer;
+  bool in_ltable = false;
+
+  // Set on the nested machine that parses an [ltable] expansion. It turns off
+  // the [ltable] rule there, so a nested [ltable] stays literal and emit_ltable
+  // cannot recurse.
+  bool in_expansion = false;
+
   std::vector<int> stack;
   std::vector<element_t> dstack;
 };
 
-// Entry points, defined where the ragel tables and both sinks are visible.
-// `parse_to_ast` builds the AST; the HTML entry is render::to_html.
+// The HTML entry is render::to_html (render.h).
 ast::Node parse_to_ast(std::string_view dtext, bool allow_color);
 // Parse a link title through the restricted basic-inline grammar. Used by the
 // textile-link builders, which run a nested parse into a tree.
