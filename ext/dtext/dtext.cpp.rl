@@ -1,4 +1,7 @@
 #include "dtext.h"
+#include "html_sink.h"
+#include "render.h"
+#include "tree_sink.h"
 
 #include <string.h>
 #include <algorithm>
@@ -15,6 +18,10 @@
 #endif
 
 static const size_t MAX_STACK_DEPTH = 512;
+
+using ast::Node;
+namespace NT = ast::NodeType;
+namespace A = ast::Attr;
 
 // Characters that mark the end of a link.
 //
@@ -62,6 +69,41 @@ static char32_t boundary_characters[] = {
   0xFF63, // '｣' U+FF63 HALFWIDTH RIGHT CORNER BRACKET
 };
 
+// Keeps RFC-3986 unreserved bytes and escapes the rest with uppercase hex. The
+// parser escapes the URL here, so a href reaches the node finished and the
+// renderer only escapes it for HTML in the attribute.
+// ASCII alphanumeric, independent of locale. Ruby's escaper uses a fixed
+// [a-zA-Z0-9] class, so a locale-sensitive isalnum would diverge on high bytes.
+static bool is_ascii_alnum(unsigned char c) {
+  return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+}
+
+static std::string uri_escape(const std::string_view s, const char whitelist = '-') {
+  static const char hex[] = "0123456789ABCDEF";
+  std::string out;
+  out.reserve(s.size());
+  for (const unsigned char c : s) {
+    if (is_ascii_alnum(c) || c == '-' || c == '_' || c == '.' || c == '~' || c == whitelist) {
+      out += c;
+    } else {
+      out += '%';
+      out += hex[c >> 4];
+      out += hex[c & 0x0F];
+    }
+  }
+  return out;
+}
+
+// ASCII-only downcase. Ruby's wiki/post-search normalisation folds only A-Z
+// (via String#downcase over ASCII here), leaving other bytes untouched.
+static std::string ascii_lower(const std::string_view s) {
+  std::string out(s);
+  for (char& c : out) {
+    if (c >= 'A' && c <= 'Z') c += 32;
+  }
+  return out;
+}
+
 %%{
 machine dtext;
 
@@ -69,7 +111,7 @@ access sm->;
 variable p sm->p;
 variable pe sm->pe;
 variable eof sm->eof;
-variable top sm->top;
+variable top sm->top_state;
 variable ts sm->ts;
 variable te sm->te;
 variable act sm->act;
@@ -83,7 +125,7 @@ prepush {
     throw DTextError("too many nested elements");
   }
 
-  if (top >= len) {
+  if (sm->top_state >= len) {
     g_debug("growing stack %zi\n", len + 16);
     stack.resize(len + 16, 0);
   }
@@ -199,17 +241,17 @@ internal_anchor = '[#' ((alnum | [_\-])+ >mark_a1 %mark_a2) ']';
 list_item = '*'+ >mark_a1 %mark_a2 ws+ nonnewline+ >mark_b1 %mark_b2;
 
 basic_inline := |*
-  '[b]'i    => { dstack_open_inline(INLINE_B, "<strong>"); };
-  '[/b]'i   => { dstack_close_inline(INLINE_B, "</strong>"); };
-  '[i]'i    => { dstack_open_inline(INLINE_I, "<em>"); };
-  '[/i]'i   => { dstack_close_inline(INLINE_I, "</em>"); };
-  '[s]'i    => { dstack_open_inline(INLINE_S, "<s>"); };
-  '[/s]'i   => { dstack_close_inline(INLINE_S, "</s>"); };
-  '[u]'i    => { dstack_open_inline(INLINE_U, "<u>"); };
-  '[/u]'i   => { dstack_close_inline(INLINE_U, "</u>"); };
+  '[b]'i    => { dstack_open_inline(INLINE_B); };
+  '[/b]'i   => { dstack_close_inline(INLINE_B); };
+  '[i]'i    => { dstack_open_inline(INLINE_I); };
+  '[/i]'i   => { dstack_close_inline(INLINE_I); };
+  '[s]'i    => { dstack_open_inline(INLINE_S); };
+  '[/s]'i   => { dstack_close_inline(INLINE_S); };
+  '[u]'i    => { dstack_open_inline(INLINE_U); };
+  '[/u]'i   => { dstack_close_inline(INLINE_U); };
   '[sup]'i  => {
     if (dstack_count(INLINE_SUP) + dstack_count(INLINE_SUB) < 3) {
-      dstack_open_inline(INLINE_SUP, "<sup>");
+      dstack_open_inline(INLINE_SUP);
     } else {
       ignored_sup_sub_tags++;
     }
@@ -218,12 +260,12 @@ basic_inline := |*
     if (ignored_sup_sub_tags > 0) {
       ignored_sup_sub_tags--;
     } else {
-      dstack_close_inline(INLINE_SUP, "</sup>");
+      dstack_close_inline(INLINE_SUP);
     }
   };
   '[sub]'i  => {
     if (dstack_count(INLINE_SUP) + dstack_count(INLINE_SUB) < 3) {
-      dstack_open_inline(INLINE_SUB, "<sub>");
+      dstack_open_inline(INLINE_SUB);
     } else {
       ignored_sup_sub_tags++;
     }
@@ -232,85 +274,67 @@ basic_inline := |*
     if (ignored_sup_sub_tags > 0) {
       ignored_sup_sub_tags--;
     } else {
-      dstack_close_inline(INLINE_SUB, "</sub>");
+      dstack_close_inline(INLINE_SUB);
     }
   };
-  any => { append_html_escaped(fc); };
+  any => { append_text(fc); };
 *|;
 
 inline := |*
   '\\`' => {
-    append("`");
+    append_text('`');
   };
 
   '`' => {
-    dstack_open_inline(INLINE_CODE, "<span class=\"inline-code\">");
+    dstack_open_inline(INLINE_CODE);
     fcall inline_code;
   };
 
   internal_anchor => {
-    append("<a id=\"");
-    std::string lowercased_tag = std::string(a1, a2 - a1);
-    std::transform(lowercased_tag.begin(), lowercased_tag.end(), lowercased_tag.begin(), [](unsigned char c) { return std::tolower(c); });
-    append_uri_escaped(lowercased_tag);
-    append("\"></a>");
+    sink.internal_anchor({ a1, a2 });
   };
 
   thumb_id => {
-    if(posts.size() < options.max_thumbs) {
-      long post_id = strtol(a1, (char**)&a2, 10);
-      posts.push_back(post_id);
-      append("<a class=\"dtext-link dtext-id-link dtext-post-id-link thumb-placeholder-link\" data-id=\"");
-      append_html_escaped({ a1, a2 });
-      append("\" href=\"");
-      append_url("/posts/");
-      append_uri_escaped({ a1, a2 });
-      append("\">");
-      append("post #");
-      append_html_escaped({ a1, a2 });
-      append("</a>");
-    } else {
-      append_id_link("post", "post", "/posts/");
-    }
+    sink.id_link("thumb", { a1, a2 });
   };
 
-  post_id => { append_id_link("post", "post", "/posts/"); };
-  post_changes_for_id => { append_id_link("post changes", "post-changes-for", "/post_versions?search[post_id]="); };
-  post_flag_id => { append_id_link("flag", "post-flag", "/post_flags/"); };
-  note_id => { append_id_link("note", "note", "/notes/"); };
-  forum_post_id => { append_id_link("forum", "forum-post", "/forum_posts/"); };
-  forum_topic_id => { append_id_link("topic", "forum-topic", "/forum_topics/"); };
-  comment_id => { append_id_link("comment", "comment", "/comments/"); };
-  pool_id => { append_id_link("pool", "pool", "/pools/"); };
-  user_id => { append_id_link("user", "user", "/users/"); };
-  artist_id => { append_id_link("artist", "artist", "/artists/"); };
-  ban_id => { append_id_link("ban", "ban", "/bans/"); };
-  bulk_update_request_id => { append_id_link("BUR", "bulk-update-request", "/bulk_update_requests/"); };
-  tag_alias_id => { append_id_link("alias", "tag-alias", "/tag_aliases/"); };
-  tag_implication_id => { append_id_link("implication", "tag-implication", "/tag_implications/"); };
-  mod_action_id => { append_id_link("mod action", "mod-action", "/mod_actions/"); };
-  user_feedback_id => { append_id_link("record", "user-feedback", "/user_feedbacks/"); };
-  wiki_page_id => { append_id_link("wiki", "wiki-page", "/wiki_pages/"); };
-  set_id => { append_id_link("set", "set", "/post_sets/"); };
-  blip_id => { append_id_link("blip", "blip", "/blips/"); };
-  ticket_id => { append_id_link("ticket", "ticket", "/tickets/"); };
-  appeal_id => { append_id_link("appeal", "appeal", "/appeals/"); };
-  takedown_id => { append_id_link("takedown", "takedown", "/takedowns/"); };
+  post_id => { sink.id_link("post", { a1, a2 }); };
+  post_changes_for_id => { sink.id_link("post_changes", { a1, a2 }); };
+  post_flag_id => { sink.id_link("flag", { a1, a2 }); };
+  note_id => { sink.id_link("note", { a1, a2 }); };
+  forum_post_id => { sink.id_link("forum_post", { a1, a2 }); };
+  forum_topic_id => { sink.id_link("topic", { a1, a2 }); };
+  comment_id => { sink.id_link("comment", { a1, a2 }); };
+  pool_id => { sink.id_link("pool", { a1, a2 }); };
+  user_id => { sink.id_link("user", { a1, a2 }); };
+  artist_id => { sink.id_link("artist", { a1, a2 }); };
+  ban_id => { sink.id_link("ban", { a1, a2 }); };
+  bulk_update_request_id => { sink.id_link("bur", { a1, a2 }); };
+  tag_alias_id => { sink.id_link("alias", { a1, a2 }); };
+  tag_implication_id => { sink.id_link("implication", { a1, a2 }); };
+  mod_action_id => { sink.id_link("mod_action", { a1, a2 }); };
+  user_feedback_id => { sink.id_link("record", { a1, a2 }); };
+  wiki_page_id => { sink.id_link("wiki", { a1, a2 }); };
+  set_id => { sink.id_link("set", { a1, a2 }); };
+  blip_id => { sink.id_link("blip", { a1, a2 }); };
+  ticket_id => { sink.id_link("ticket", { a1, a2 }); };
+  appeal_id => { sink.id_link("appeal", { a1, a2 }); };
+  takedown_id => { sink.id_link("takedown", { a1, a2 }); };
 
   basic_post_search_link => {
-    append_post_search_link({ a1, a2 }, { a1, a2 });
+    emit_post_search_link({ a1, a2 }, { a1, a2 });
   };
 
   aliased_post_search_link => {
-    append_post_search_link({ a1, a2 }, { b1, b2 });
+    emit_post_search_link({ a1, a2 }, { b1, b2 });
   };
 
   basic_wiki_link => {
-    append_wiki_link({ a1, a2 }, { a1, a2 });
+    emit_wiki_link({ a1, a2 }, { a1, a2 });
   };
 
   aliased_wiki_link => {
-    append_wiki_link({ a1, a2 }, { b1, b2 });
+    emit_wiki_link({ a1, a2 }, { b1, b2 });
   };
 
   basic_textile_link => {
@@ -318,15 +342,15 @@ inline := |*
     const char* url_start = b1;
     const char* url_end = find_boundary_c(match_end - 1) + 1;
 
-    append_named_url({ url_start, url_end }, { a1, a2 });
+    emit_named_url({ url_start, url_end }, { a1, a2 });
 
     if (url_end < match_end) {
-      append_html_escaped({ url_end, match_end });
+      append_text({ url_end, match_end });
     }
   };
 
   bracketed_textile_link => {
-    append_named_url({ b1, b2 }, { a1, a2 });
+    emit_named_url({ b1, b2 }, { a1, a2 });
   };
 
   url => {
@@ -334,15 +358,15 @@ inline := |*
     const char* url_start = ts;
     const char* url_end = find_boundary_c(match_end - 1) + 1;
 
-    append_unnamed_url({ url_start, url_end });
+    sink.unnamed_url({ url_start, url_end });
 
     if (url_end < match_end) {
-      append_html_escaped({ url_end, match_end });
+      append_text({ url_end, match_end });
     }
   };
 
   delimited_url => {
-    append_unnamed_url({ a1, a2 });
+    sink.unnamed_url({ a1, a2 });
   };
 
   newline list_item => {
@@ -351,17 +375,17 @@ inline := |*
     fret;
   };
 
-  '[b]'i  => { dstack_open_inline(INLINE_B, "<strong>"); };
-  '[/b]'i => { dstack_close_inline(INLINE_B, "</strong>"); };
-  '[i]'i  => { dstack_open_inline(INLINE_I, "<em>"); };
-  '[/i]'i => { dstack_close_inline(INLINE_I, "</em>"); };
-  '[s]'i  => { dstack_open_inline(INLINE_S, "<s>"); };
-  '[/s]'i => { dstack_close_inline(INLINE_S, "</s>"); };
-  '[u]'i  => { dstack_open_inline(INLINE_U, "<u>"); };
-  '[/u]'i => { dstack_close_inline(INLINE_U, "</u>"); };
+  '[b]'i  => { dstack_open_inline(INLINE_B); };
+  '[/b]'i => { dstack_close_inline(INLINE_B); };
+  '[i]'i  => { dstack_open_inline(INLINE_I); };
+  '[/i]'i => { dstack_close_inline(INLINE_I); };
+  '[s]'i  => { dstack_open_inline(INLINE_S); };
+  '[/s]'i => { dstack_close_inline(INLINE_S); };
+  '[u]'i  => { dstack_open_inline(INLINE_U); };
+  '[/u]'i => { dstack_close_inline(INLINE_U); };
   '[sup]'i  => {
     if (dstack_count(INLINE_SUP) + dstack_count(INLINE_SUB) < 3) {
-      dstack_open_inline(INLINE_SUP, "<sup>");
+      dstack_open_inline(INLINE_SUP);
     } else {
       ignored_sup_sub_tags++;
     }
@@ -370,12 +394,12 @@ inline := |*
     if (ignored_sup_sub_tags > 0) {
       ignored_sup_sub_tags--;
     } else {
-      dstack_close_inline(INLINE_SUP, "</sup>");
+      dstack_close_inline(INLINE_SUP);
     }
   };
   '[sub]'i  => {
     if (dstack_count(INLINE_SUP) + dstack_count(INLINE_SUB) < 3) {
-      dstack_open_inline(INLINE_SUB, "<sub>");
+      dstack_open_inline(INLINE_SUB);
     } else {
       ignored_sup_sub_tags++;
     }
@@ -384,44 +408,33 @@ inline := |*
     if (ignored_sup_sub_tags > 0) {
       ignored_sup_sub_tags--;
     } else {
-      dstack_close_inline(INLINE_SUB, "</sub>");
+      dstack_close_inline(INLINE_SUB);
     }
   };
 
   color_typed => {
-    if(options.allow_color) {
-      dstack_push(INLINE_COLOR);
-      append("<span class=\"dtext-color-");
-      append_uri_escaped({ a1, a2 });
-      append("\">");
+    if (allow_color) {
+      open_colored_span({ a1, a2 }, true);
     }
     fgoto inline;
   };
 
   color_open => {
-    if(options.allow_color) {
-      dstack_push(INLINE_COLOR);
-      append("<span class=\"dtext-color\" style=\"color:");
-      if(a1[0] == '#') {
-        append("#");
-        append_uri_escaped({ a1 + 1, a2 });
-      } else {
-        append_uri_escaped({ a1, a2 });
-      }
-      append("\">");
+    if (allow_color) {
+      open_colored_span({ a1, a2 }, false);
     }
     fgoto inline;
   };
 
   color_close => {
-    if(options.allow_color) {
-      dstack_close_inline(INLINE_COLOR, "</span>");
+    if (allow_color) {
+      dstack_close_inline(INLINE_COLOR);
     }
     fgoto inline;
   };
 
   spoilers_open => {
-    dstack_open_inline(INLINE_SPOILER, "<span class=\"spoiler\">");
+    dstack_open_inline(INLINE_SPOILER);
   };
 
   newline* spoilers_close => {
@@ -429,8 +442,8 @@ inline := |*
     dstack_close_before_block();
 
     if (dstack_check(INLINE_SPOILER)) {
-      dstack_close_inline(INLINE_SPOILER, "</span>");
-    } else if (dstack_close_block(BLOCK_SPOILER, "</div>")) {
+      dstack_close_inline(INLINE_SPOILER);
+    } else if (dstack_close_block(BLOCK_SPOILER)) {
       fret;
     }
   };
@@ -462,7 +475,7 @@ inline := |*
       dstack_rewind();
       fret;
     } else {
-      append_block("[/table]");
+      append_raw_block("[/table]");
     }
   };
 
@@ -484,7 +497,7 @@ inline := |*
       dstack_rewind();
       fret;
     } else {
-      append_block("[/code]");
+      append_raw_block("[/code]");
     }
   };
 
@@ -529,13 +542,13 @@ inline := |*
   };
 
   '[/th]'i => {
-    if (dstack_close_block(BLOCK_TH, "</th>")) {
+    if (dstack_close_block(BLOCK_TH)) {
       fret;
     }
   };
 
   newline* '[/td]'i => {
-    if (dstack_close_block(BLOCK_TD, "</td>")) {
+    if (dstack_close_block(BLOCK_TD)) {
       fret;
     }
   };
@@ -560,32 +573,32 @@ inline := |*
       dstack_close_list();
       fret;
     } else {
-      append("<br>");
+      append_line_break();
     }
   };
 
   '\r' => {
-    append(' ');
+    append_text(' ');
   };
 
   any => {
     g_debug("inline char: %c", fc);
-    append_html_escaped(fc);
+    append_text(fc);
   };
 *|;
 
 inline_code := |*
   '\\`' => {
-    append("`");
+    append_content('`');
   };
 
   '`' => {
-    dstack_close_inline(INLINE_CODE, "</span>");
+    dstack_close_inline(INLINE_CODE);
     fret;
   };
 
   any => {
-    append_html_escaped(fc);
+    append_content(fc);
   };
 *|;
 
@@ -594,53 +607,53 @@ code := |*
     if (dstack_check(BLOCK_CODE)) {
       dstack_rewind();
     } else {
-      append("[/code]");
+      append_content("[/code]");
     }
     fret;
   };
 
   any => {
-    append_html_escaped(fc);
+    append_content(fc);
   };
 *|;
 
 table := |*
   '[thead]'i => {
-    dstack_open_block(BLOCK_THEAD, "<thead>");
+    dstack_open_block(BLOCK_THEAD);
   };
 
   '[/thead]'i => {
-    dstack_close_block(BLOCK_THEAD, "</thead>");
+    dstack_close_block(BLOCK_THEAD);
   };
 
   '[tbody]'i => {
-    dstack_open_block(BLOCK_TBODY, "<tbody>");
+    dstack_open_block(BLOCK_TBODY);
   };
 
   '[/tbody]'i => {
-    dstack_close_block(BLOCK_TBODY, "</tbody>");
+    dstack_close_block(BLOCK_TBODY);
   };
 
   '[th]'i => {
-    dstack_open_block(BLOCK_TH, "<th>");
+    dstack_open_block(BLOCK_TH);
     fcall inline;
   };
 
   '[tr]'i => {
-    dstack_open_block(BLOCK_TR, "<tr>");
+    dstack_open_block(BLOCK_TR);
   };
 
   '[/tr]'i => {
-    dstack_close_block(BLOCK_TR, "</tr>");
+    dstack_close_block(BLOCK_TR);
   };
 
   '[td]'i => {
-    dstack_open_block(BLOCK_TD, "<td>");
+    dstack_open_block(BLOCK_TD);
     fcall inline;
   };
 
   '[/table]'i => {
-    if (dstack_close_block(BLOCK_TABLE, "</table>")) {
+    if (dstack_close_block(BLOCK_TABLE)) {
       fret;
     }
   };
@@ -650,13 +663,9 @@ table := |*
 
 main := |*
   header => {
-    static element_t blocks[] = { BLOCK_H1, BLOCK_H2, BLOCK_H3, BLOCK_H4, BLOCK_H5, BLOCK_H6 };
-    char header = *a1;
-    element_t block = blocks[header - '1'];
+    element_t block = (element_t)(BLOCK_H1 + (*a1 - '1'));
 
-    dstack_open_block(block, "<h");
-    append_block(header);
-    append_block(">");
+    dstack_open_block(block);
 
     header_mode = true;
     fcall inline;
@@ -664,41 +673,28 @@ main := |*
 
   quote_open space* => {
     dstack_close_leaf_blocks();
-    dstack_open_block(BLOCK_QUOTE, "<blockquote>");
+    dstack_open_block(BLOCK_QUOTE);
   };
 
   quote_open_colored_typed => {
     dstack_close_leaf_blocks();
-    dstack_open_block(BLOCK_QUOTE, "<blockquote class=\"dtext-sidebar-colored-");
-    if (!options.f_inline) {
-      append_uri_escaped({ a1, a2 });
-      append("\">");
-    }
+    open_colored_quote({ a1, a2 }, true);
   };
 
   quote_open_colored => {
     dstack_close_leaf_blocks();
-    dstack_open_block(BLOCK_QUOTE, "<blockquote class=\"dtext-quote-color\" style=\"border-left-color:");
-    if (!options.f_inline) {
-      if(a1[0] == '#') {
-        append("#");
-        append_uri_escaped({ a1 + 1, a2 });
-      } else {
-        append_uri_escaped({ a1, a2 });
-      }
-      append("\">");
-    }
+    open_colored_quote({ a1, a2 }, false);
   };
 
   spoilers_open space* => {
     dstack_close_leaf_blocks();
-    dstack_open_block(BLOCK_SPOILER, "<div class=\"spoiler\">");
+    dstack_open_block(BLOCK_SPOILER);
   };
 
   spoilers_close => {
     g_debug("block [/spoiler]");
     dstack_close_before_block();
-    if (dstack_check( BLOCK_SPOILER)) {
+    if (dstack_check(BLOCK_SPOILER)) {
       g_debug("  rewind");
       dstack_rewind();
     }
@@ -706,7 +702,7 @@ main := |*
 
   '[code]'i space* => {
     dstack_close_leaf_blocks();
-    dstack_open_block(BLOCK_CODE, "<pre>");
+    dstack_open_block(BLOCK_CODE);
     fcall code;
   };
 
@@ -730,7 +726,7 @@ main := |*
 
   '[table]'i => {
     dstack_close_leaf_blocks();
-    dstack_open_block(BLOCK_TABLE, "<table class=\"striped\">");
+    dstack_open_block(BLOCK_TABLE);
     fcall table;
   };
 
@@ -762,7 +758,7 @@ main := |*
     fhold;
 
     if (dstack.empty() || dstack_check(BLOCK_QUOTE) || dstack_check(BLOCK_SPOILER) || dstack_check(BLOCK_SECTION)) {
-      dstack_open_block(BLOCK_P, "<p>");
+      dstack_open_block(BLOCK_P);
     }
 
     fcall inline;
@@ -773,284 +769,176 @@ main := |*
 
 %% write data;
 
-void StateMachine::dstack_push(element_t element) {
+template <class SinkT>
+void StateMachine<SinkT>::dstack_push(element_t element) {
   dstack.push_back(element);
+  sink.open(element);
 }
 
-element_t StateMachine::dstack_pop() {
-  if (dstack.empty()) {
-    g_debug("dstack pop empty stack");
-    return DSTACK_EMPTY;
-  } else {
-    auto element = dstack.back();
-    dstack.pop_back();
-    return element;
-  }
-}
-
-element_t StateMachine::dstack_peek() {
+template <class SinkT>
+element_t StateMachine<SinkT>::dstack_peek() {
   return dstack.empty() ? DSTACK_EMPTY : dstack.back();
 }
 
-bool StateMachine::dstack_check(element_t expected_element) {
+template <class SinkT>
+bool StateMachine<SinkT>::dstack_check(element_t expected_element) {
   return dstack_peek() == expected_element;
 }
 
-// Return true if the given tag is currently open.
-bool StateMachine::dstack_is_open(element_t element) {
+template <class SinkT>
+bool StateMachine<SinkT>::dstack_is_open(element_t element) {
   return std::find(dstack.begin(), dstack.end(), element) != dstack.end();
 }
 
-int StateMachine::dstack_count(element_t element) {
+template <class SinkT>
+int StateMachine<SinkT>::dstack_count(element_t element) {
   return std::count(dstack.begin(), dstack.end(), element);
 }
 
-void StateMachine::append(const std::string_view c) {
-  output += c;
+template <class SinkT>
+void StateMachine<SinkT>::append_line_break() {
+  sink.line_break();
 }
 
-void StateMachine::append(const char c) {
-  output += c;
+// Text and code bodies go straight to the sink, with no buffer in between.
+template <class SinkT>
+void StateMachine<SinkT>::append_text(const std::string_view text) {
+  sink.text(text);
 }
 
-void StateMachine::append_block(const std::string_view s) {
-  if (!options.f_inline) {
-    append(s);
-  }
+template <class SinkT>
+void StateMachine<SinkT>::append_text(char c) {
+  sink.text(std::string_view(&c, 1));
 }
 
-void StateMachine::append_block(const char s) {
-  if (!options.f_inline) {
-    append(s);
-  }
+template <class SinkT>
+void StateMachine<SinkT>::append_content(const std::string_view text) {
+  sink.content(text);
 }
 
-void StateMachine::append_html_escaped(char s) {
-  switch (s) {
-    case '<': append("&lt;"); break;
-    case '>': append("&gt;"); break;
-    case '&': append("&amp;"); break;
-    case '"': append("&quot;"); break;
-    default:  append(s);
-  }
+template <class SinkT>
+void StateMachine<SinkT>::append_content(char c) {
+  sink.content(std::string_view(&c, 1));
 }
 
-void StateMachine::append_html_escaped(const std::string_view input) {
-  for (const unsigned char c : input) {
-    append_html_escaped(c);
-  }
+template <class SinkT>
+void StateMachine<SinkT>::append_raw_block(const std::string_view text) {
+  sink.raw_block(text);
 }
 
-void StateMachine::append_uri_escaped(const std::string_view uri_part, const char whitelist) {
-  static const char hex[] = "0123456789ABCDEF";
-
-  for (const unsigned char c : uri_part) {
-    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~' || c == whitelist) {
-      append(c);
-    } else {
-      append('%');
-      append(hex[c >> 4]);
-      append(hex[c & 0x0F]);
-    }
-  }
+template <class SinkT>
+void StateMachine<SinkT>::emit_named_url(const std::string_view url, const std::string_view title) {
+  sink.named_url(url, parse_basic_inline(title));
 }
 
-void StateMachine::append_url(const char* url) {
-  if ((url[0] == '/' || url[0] == '#') && !options.base_url.empty()) {
-    append(options.base_url);
-  }
+template <class SinkT>
+void StateMachine<SinkT>::emit_wiki_link(const std::string_view tag, const std::string_view title) {
+  std::string normalized_tag(tag);
+  std::transform(normalized_tag.begin(), normalized_tag.end(), normalized_tag.begin(),
+                 [](unsigned char c) { return c == ' ' ? '_' : (c >= 'A' && c <= 'Z' ? c + 32 : c); });
 
-  append(url);
-}
-
-void StateMachine::append_id_link(const char * title, const char * id_name, const char * url) {
-  append("<a class=\"dtext-link dtext-id-link dtext-");
-  append(id_name);
-  append("-id-link\" href=\"");
-  append_url(url);
-  append_uri_escaped({ a1, a2 });
-  append("\">");
-  append(title);
-  append(" #");
-  append_html_escaped({ a1, a2 });
-  append("</a>");
-}
-
-void StateMachine::append_unnamed_url(const std::string_view url) {
-  append("<a rel=\"nofollow\" class=\"dtext-link\" href=\"");
-  append_html_escaped(url);
-  append("\">");
-  append_html_escaped(url);
-  append("</a>");
-}
-
-void StateMachine::append_named_url(const std::string_view url, const std::string_view title) {
-  auto parsed_title = parse_basic_inline(title);
-
-  if (url[0] == '/' || url[0] == '#') {
-    append("<a rel=\"nofollow\" class=\"dtext-link\" href=\"");
-    if (!options.base_url.empty()) {
-      append(options.base_url);
-    }
-  } else {
-    append("<a rel=\"nofollow\" class=\"dtext-link dtext-external-link\" href=\"");
-  }
-
-  append_html_escaped(url);
-  append("\">");
-  append(parsed_title);
-  append("</a>");
-}
-
-void StateMachine::append_wiki_link(const std::string_view tag, const std::string_view title) {
-  std::string normalized_tag = std::string(tag);
-  std::transform(normalized_tag.begin(), normalized_tag.end(), normalized_tag.begin(), [](unsigned char c) { return c == ' ' ? '_' : std::tolower(c); });
-
-  // FIXME: Take the anchor as an argument here
+  // FIXME: Take the anchor as an argument here (mirrors the ruby comment).
+  std::string href;
   if (tag[0] == '#') {
-    append("<a rel=\"nofollow\" class=\"dtext-link dtext-wiki-link\" href=\"#");
-    append_uri_escaped(normalized_tag.substr(1, normalized_tag.size() - 1));
-    append("\">");
+    href = "#" + uri_escape(normalized_tag.substr(1));
   } else {
-    append("<a rel=\"nofollow\" class=\"dtext-link dtext-wiki-link\" href=\"");
-    append_url("/wiki_pages/show_or_new?title=");
-    append_uri_escaped(normalized_tag, '#');
-    append("\">");
+    // The '#' whitelist keeps a literal '#' in the ?title= query (ruby passes
+    // '#' as the whitelist byte), so a tag anchor stays readable in the href
+    // rather than becoming %23.
+    href = "/wiki_pages/show_or_new?title=" + uri_escape(normalized_tag, '#');
   }
-  append_html_escaped(title);
-  append("</a>");
+
+  sink.wiki_link(href, title);
 }
 
-void StateMachine::append_post_search_link(const std::string_view tag, const std::string_view title) {
-  std::string normalized_tag = std::string(tag);
-  std::transform(normalized_tag.begin(), normalized_tag.end(), normalized_tag.begin(), [](unsigned char c) { return std::tolower(c); });
-
-  append("<a rel=\"nofollow\" class=\"dtext-link dtext-post-search-link\" href=\"");
-  append_url("/posts?tags=");
-  append_uri_escaped(normalized_tag);
-  append("\">");
-  append_html_escaped(title);
-  append("</a>");
+template <class SinkT>
+void StateMachine<SinkT>::emit_post_search_link(const std::string_view tag, const std::string_view title) {
+  std::string href = "/posts?tags=" + uri_escape(ascii_lower(tag));
+  sink.post_search_link(href, title);
 }
 
-void StateMachine::append_section(const std::string_view summary, bool initially_open) {
+template <class SinkT>
+void StateMachine<SinkT>::append_section(const std::string_view summary, bool initially_open) {
   dstack_close_leaf_blocks();
-  dstack_open_block(BLOCK_SECTION, "<details");
-  if (initially_open) {
-     append_block(" open");
-  }
-  append_block(">");
-  append_block("<summary>");
-  if (!summary.empty()) {
-    append_html_escaped(summary);
-  }
-  append_block("</summary><div>");
+  dstack.push_back(BLOCK_SECTION);
+  std::string title(summary);
+  sink.open_section(summary.empty() ? nullptr : &title, initially_open);
 }
 
-void StateMachine::append_closing_p() {
-  if (output.size() > 4 && output.ends_with("<br>")) {
-    output.resize(output.size() - 4);
-  }
-
-  if (output.size() > 3 && output.ends_with("<p>")) {
-    output.resize(output.size() - 3);
-    return;
-  }
-
-  append_block("</p>");
-}
-
-void StateMachine::dstack_open_inline(element_t type, const char * html) {
-  g_debug("push inline element [%d]: %s", type, html);
-
+template <class SinkT>
+void StateMachine<SinkT>::dstack_open_block(element_t type) {
   dstack_push(type);
-  append(html);
 }
 
-void StateMachine::dstack_open_block(element_t type, const char * html) {
-  g_debug("push block element [%d]: %s", type, html);
-
+template <class SinkT>
+void StateMachine<SinkT>::dstack_open_inline(element_t type) {
   dstack_push(type);
-  append_block(html);
 }
 
-void StateMachine::dstack_close_inline(element_t type, const char * close_html) {
+template <class SinkT>
+void StateMachine<SinkT>::open_colored_quote(std::string_view color, bool category) {
+  dstack.push_back(BLOCK_QUOTE);
+  std::string value(color);
+  sink.open_quote(&value, category);
+}
+
+template <class SinkT>
+void StateMachine<SinkT>::open_colored_span(std::string_view color, bool category) {
+  dstack.push_back(INLINE_COLOR);
+  sink.open_color(color, category);
+}
+
+template <class SinkT>
+void StateMachine<SinkT>::dstack_close_inline(element_t type) {
   if (dstack_check(type)) {
-    g_debug("pop inline element [%d]: %s", type, close_html);
-
-    dstack_pop();
-    append(close_html);
+    dstack_rewind();
   } else {
-    g_debug("ignored out-of-order closing inline tag [%d]", type);
-
-    append({ ts, te });
+    append_text(std::string_view(ts, te - ts));
   }
 }
 
-bool StateMachine::dstack_close_block(element_t type, const char * close_html) {
+template <class SinkT>
+bool StateMachine<SinkT>::dstack_close_block(element_t type) {
   if (dstack_check(type)) {
-    g_debug("pop block element [%d]: %s", type, close_html);
-
-    dstack_pop();
-    append_block(close_html);
+    dstack_rewind();
     return true;
   } else {
-    g_debug("ignored out-of-order closing block tag [%d]", type);
-
-    append_block({ ts, te });
+    append_raw_block(std::string_view(ts, te - ts));
     return false;
   }
 }
 
-// Close the last open tag.
-void StateMachine::dstack_rewind() {
-  element_t element = dstack_pop();
+// Closes the innermost open element. Trimming a trailing <br> and an empty <p>
+// is left to the renderer, because a span hidden by allow_color can bury the
+// last <br>. The HTML sink trims, and the tree keeps the raw shape.
+template <class SinkT>
+void StateMachine<SinkT>::dstack_rewind() {
+  element_t element = dstack.back();
+  dstack.pop_back();
 
-  switch(element) {
-    case BLOCK_P: append_closing_p(); break;
-    case INLINE_SPOILER: append("</span>"); break;
-    case BLOCK_SPOILER: append_block("</div>"); break;
-    case BLOCK_QUOTE: append_block("</blockquote>"); break;
-    case BLOCK_SECTION: append_block("</div></details>"); break;
-    case BLOCK_CODE: append_block("</pre>"); break;
-    case BLOCK_TD: append_block("</td>"); break;
-    case BLOCK_TH: append_block("</th>"); break;
+  switch (element) {
+    case BLOCK_TR: case BLOCK_UL: case BLOCK_LI:
+    case BLOCK_H1: case BLOCK_H2: case BLOCK_H3:
+    case BLOCK_H4: case BLOCK_H5: case BLOCK_H6:
+      header_mode = false;
+      break;
 
-    case INLINE_B: append("</strong>"); break;
-    case INLINE_I: append("</em>"); break;
-    case INLINE_U: append("</u>"); break;
-    case INLINE_S: append("</s>"); break;
-    case INLINE_SUB: append("</sub>"); break;
-    case INLINE_SUP: append("</sup>"); break;
-    case INLINE_COLOR: append("</span>"); break;
-    case INLINE_CODE: append("</span>"); break;
-
-    case BLOCK_TABLE: append_block("</table>"); break;
-    case BLOCK_THEAD: append_block("</thead>"); break;
-    case BLOCK_TBODY: append_block("</tbody>"); break;
-    case BLOCK_TR: append_block("</tr>"); header_mode = false; break;
-    case BLOCK_UL: append_block("</ul>"); header_mode = false; break;
-    case BLOCK_LI: append_block("</li>"); header_mode = false; break;
-    case BLOCK_H6: append_block("</h6>"); header_mode = false; break;
-    case BLOCK_H5: append_block("</h5>"); header_mode = false; break;
-    case BLOCK_H4: append_block("</h4>"); header_mode = false; break;
-    case BLOCK_H3: append_block("</h3>"); header_mode = false; break;
-    case BLOCK_H2: append_block("</h2>"); header_mode = false; break;
-    case BLOCK_H1: append_block("</h1>"); header_mode = false; break;
-
-    case DSTACK_EMPTY: break;
+    default:
+      break;
   }
+
+  sink.close(element);
 }
 
-// Close the last open paragraph or list, if there is one.
-void StateMachine::dstack_close_before_block() {
+template <class SinkT>
+void StateMachine<SinkT>::dstack_close_before_block() {
   while (dstack_check(BLOCK_P) || dstack_check(BLOCK_LI) || dstack_check(BLOCK_UL)) {
     dstack_rewind();
   }
 }
 
-// Close all remaining open tags.
-void StateMachine::dstack_close_all() {
+template <class SinkT>
+void StateMachine<SinkT>::dstack_close_all() {
   while (!dstack.empty()) {
     dstack_rewind();
   }
@@ -1058,16 +946,15 @@ void StateMachine::dstack_close_all() {
 
 // container blocks: [quote], [spoiler], [section]
 // leaf blocks: [code], [table], [td]?, [th]?, <h1>, <p>, <li>, <ul>
-void StateMachine::dstack_close_leaf_blocks() {
-  g_debug("dstack close leaf blocks");
-
+template <class SinkT>
+void StateMachine<SinkT>::dstack_close_leaf_blocks() {
   while (!dstack.empty() && !dstack_check(BLOCK_QUOTE) && !dstack_check(BLOCK_SPOILER) && !dstack_check(BLOCK_SECTION)) {
     dstack_rewind();
   }
 }
 
-// Close all open tags up to and including the given tag.
-void StateMachine::dstack_close_until(element_t element) {
+template <class SinkT>
+void StateMachine<SinkT>::dstack_close_until(element_t element) {
   while (!dstack.empty() && !dstack_check(element)) {
     dstack_rewind();
   }
@@ -1075,9 +962,8 @@ void StateMachine::dstack_close_until(element_t element) {
   dstack_rewind();
 }
 
-void StateMachine::dstack_open_list(int depth) {
-  g_debug("open list");
-
+template <class SinkT>
+void StateMachine<SinkT>::dstack_open_list(int depth) {
   if (dstack_is_open(BLOCK_LI)) {
     dstack_close_until(BLOCK_LI);
   } else {
@@ -1085,17 +971,18 @@ void StateMachine::dstack_open_list(int depth) {
   }
 
   while (dstack_count(BLOCK_UL) < depth) {
-    dstack_open_block(BLOCK_UL, "<ul>");
+    dstack_open_block(BLOCK_UL);
   }
 
   while (dstack_count(BLOCK_UL) > depth) {
-    dstack_close_until( BLOCK_UL);
+    dstack_close_until(BLOCK_UL);
   }
 
-  dstack_open_block(BLOCK_LI, "<li>");
+  dstack_open_block(BLOCK_LI);
 }
 
-void StateMachine::dstack_close_list() {
+template <class SinkT>
+void StateMachine<SinkT>::dstack_close_list() {
   while (dstack_is_open(BLOCK_UL)) {
     dstack_close_until(BLOCK_UL);
   }
@@ -1104,7 +991,7 @@ void StateMachine::dstack_close_list() {
 static inline std::tuple<char32_t, int> get_utf8_char(const char* c) {
   const unsigned char* p = reinterpret_cast<const unsigned char*>(c);
 
-  // 0x10xxxxxx is a continuation byte; back up to the leading byte.
+  // 0x10xxxxxx is a UTF-8 continuation byte.
   while ((p[0] >> 6) == 0b10) {
     p--;
   }
@@ -1139,11 +1026,11 @@ static inline const char* find_boundary_c(const char* c) {
   }
 }
 
-StateMachine::StateMachine(const std::string_view dtext, int initial_state, const DTextOptions options) : options(options) {
-  output.reserve(dtext.size() * 1.5);
+template <class SinkT>
+StateMachine<SinkT>::StateMachine(const std::string_view dtext, int initial_state, bool allow_color, SinkT& sink)
+    : sink(sink), allow_color(allow_color) {
   stack.reserve(16);
   dstack.reserve(16);
-  posts.reserve(10);
 
   p = dtext.data();
   pb = p;
@@ -1152,30 +1039,41 @@ StateMachine::StateMachine(const std::string_view dtext, int initial_state, cons
   cs = initial_state;
 }
 
-std::string StateMachine::parse_basic_inline(const std::string_view dtext) {
-    DTextOptions options = {};
-    options.f_inline = true;
-    options.allow_color = false;
-    options.max_thumbs = 0;
-
-    StateMachine sm(dtext, dtext_en_basic_inline, options);
-
-    return sm.parse().dtext;
-}
-
-DTextResult StateMachine::parse_dtext(const std::string_view dtext, DTextOptions options) {
-  StateMachine sm(dtext, dtext_en_main, options);
-  return sm.parse();
-}
-
-DTextResult StateMachine::parse() {
-  StateMachine* sm = this;
+template <class SinkT>
+void StateMachine<SinkT>::run() {
+  auto* sm = this;
   g_debug("start\n");
 
   %% write init nocs;
   %% write exec;
 
   sm->dstack_close_all();
+}
 
-  return DTextResult { sm->output, sm->posts };
+// The tree builder and the HTML emitter are the only sinks, so the machine is
+// generated once for each.
+template class StateMachine<sink::TreeSink>;
+template class StateMachine<HtmlSink>;
+
+std::vector<ast::Node> parse_basic_inline(const std::string_view dtext) {
+  // The basic-inline machine has no color rule, so allow_color is moot here.
+  sink::TreeSink tree;
+  StateMachine<sink::TreeSink> sm(dtext, dtext_en_basic_inline, false, tree);
+  sm.run();
+  return std::move(tree.take_document().children);
+}
+
+ast::Node parse_to_ast(const std::string_view dtext, bool allow_color) {
+  sink::TreeSink tree;
+  StateMachine<sink::TreeSink> sm(dtext, dtext_en_main, allow_color, tree);
+  sm.run();
+  return tree.take_document();
+}
+
+render::Result render::to_html(const std::string_view dtext, bool allow_color, const render::Options& options) {
+  HtmlSink sink(options);
+  sink.out.reserve(dtext.size() + dtext.size() / 2 + 64);
+  StateMachine<HtmlSink> sm(dtext, dtext_en_main, allow_color, sink);
+  sm.run();
+  return sink.take_result();
 }
